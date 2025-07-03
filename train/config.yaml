@@ -1,0 +1,124 @@
+# ===================================================================
+#        Temporal Fusion Transformer Eğitim Yapılandırma Şablonu
+# ===================================================================
+# Bu dosya, `egitim_scripti.py` tarafından kullanılan tüm parametreleri
+# içerir. Kendi projeniz için değerleri düzenleyebilirsiniz.
+# ===================================================================
+
+# --- Proje ve Deney İsimlendirmesi ---
+# TensorBoard ve kayıt dizinlerini organize etmek için kullanılır.
+project_name: "TFT_Proje_Sablonu"
+run_name: "deney_001"
+
+# --- Veri Yapılandırması ---
+data:
+  # CSV verinizin tam yolu. 'datetime' adında bir tarih sütunu içermelidir.
+  path: "veriseti/sizin_veriniz.csv" # <-- BU YOLU KENDİNİZE GÖRE DEĞİŞTİRİN
+
+# --- Model Tanımı ---
+# Temporal Fusion Transformer modelinin temel yapısını tanımlar.
+model:
+  # Tahmin edilecek hedef değişkenin sütun adı.
+  target: "hedef_sutununuz"
+
+  # Zaman serilerini birbirinden ayıran grup kimlikleri.
+  # Örnek: Hisse senedi sembolleri, mağaza ID'leri vb.
+  # Eğer tek bir zaman seriniz varsa, script otomatik olarak 'default_group' oluşturur.
+  group_ids: ["grup_id_sutunu"]
+
+  # Modelin geçmişe bakacağı adım sayısı (geçmiş penceresi).
+  sequence_length: 128
+
+  # Modelin geleceğe yönelik tahmin yapacağı adım sayısı (tahmin ufku).
+  prediction_steps: 16
+
+  # Değerleri gelecekte bilinen kategorik ve reel özellikler.
+  # Örnek: Haftanın günü, ay, tatil günleri, planlanmış promosyonlar vb.
+  static_categoricals: []
+  static_reals: []
+  time_varying_known_categoricals: []
+  time_varying_known_reals: []
+  
+  # Değerleri sadece geçmişte bilinen kategorik ve reel özellikler.
+  # Modelin asıl öğrendiği sinyaller genellikle buradadır.
+  time_varying_unknown_categoricals: []
+  time_varying_unknown_reals: [
+    # Buraya kendi özellik (feature) sütun adlarınızı ekleyin.
+    "oznitelik_1",
+    "oznitelik_2",
+    "oznitelik_3",
+    "hedef_sutununuz" # Hedef değişken genellikle bilinmeyen bir reel özellik olarak da eklenir.
+  ]
+
+# --- TFT Modelinin Hiperparametreleri ---
+# `pytorch_forecasting` kütüphanesindeki TFT modelinin detaylı ayarları.
+model_params:
+  lstm_layers: 2
+  hidden_size: 160
+  attention_head_size: 4
+  dropout: 0.1
+  hidden_continuous_size: 80
+
+# --- Özel Kayıp Fonksiyonu Parametreleri ---
+# Noktasal, değişim ve dalgacık kayıplarını birleştiren hibrit fonksiyonun ayarları.
+loss_params:
+  gamma: 1.0          # Noktasal kayıp (MAE/RMSE) ağırlığı
+  beta: 1.0           # Değişim (fark) kaybı ağırlığı
+  alpha: 1.0          # Dalgacık (wavelet) kaybı ağırlığı
+  point_metric: "rmse" # 'rmse' veya 'mae' olabilir
+  diff_metric: "rmse"  # 'rmse' veya 'mae' olabilir
+  wavelet_metric: "rmse" # 'rmse' veya 'mae' olabilir
+  levels: 3           # Dalgacık ayrıştırma seviyesi
+  eps: 1.0e-7         # Nümerik stabilite için küçük bir sayı
+  wavelet_family: "db4" # Bilgilendirme amaçlı, kodda db4 hard-coded.
+
+# --- Eğitim Süreci Ayarları ---
+training:
+  # Tekrarlanabilir sonuçlar için rastgelelik tohumu.
+  seed: 42
+  # 'start_new': Eğitimi baştan başlatır.
+  # 'resume': Kayıtlı son checkpoint'ten devam eder.
+  mode: "start_new"
+  # GPU VRAM'inize ve veri boyutunuza göre ayarlayın.
+  batch_size: 64
+  # Ampere ve üstü GPU'larda hızı artırabilir.
+  compile_model: true
+  # Validasyon kaybı iyileşmediğinde kaç epoch bekleneceği.
+  early_stopping_patience: 15
+  # Veri artırma tekniği. [1,1] devre dışı bırakır. [1,16] her epoch'ta 1 ila 16 arasında rastgele atlamalı örnekleme yapar.
+  dynamic_stride_range: [1, 1]
+  # Özel bir ağırlık başlatma stratejisi kullanılsın mı?
+  use_custom_weight_init: true
+  # Eğer `use_custom_weight_init` true ise, ağırlıkların başlatılacağı aralık.
+  custom_init_range: [-0.01, 0.01]
+
+# --- Optimizer ve Öğrenme Oranı Zamanlayıcı Ayarları ---
+optimizer_params:
+  lr: 0.001
+
+lr_scheduler_params:
+  # Hangi metriği izleyeceği.
+  monitor: "val/loss"
+  # ReduceLROnPlateau scheduler'ının parametreleri.
+  params:
+    mode: "min"
+    factor: 0.1
+    patience: 5
+
+# --- PyTorch Lightning Trainer Parametreleri ---
+# https://lightning.ai/docs/pytorch/stable/common/trainer.html#trainer-class-api
+trainer_params:
+  max_epochs: 100
+  accelerator: "gpu"
+  devices: 1
+  # '16-mixed' veya 'bf16-mixed' VRAM'i rahatlatabilir. '32-true' standarttır.
+  precision: "32-true"
+  # Gradyan patlamalarını önlemek için.
+  gradient_clip_val: 1.0
+  
+# --- Loglama ve Checkpoint Ayarları ---
+logging:
+  # Tüm logların ve modellerin kaydedileceği ana dizin.
+  log_dir: "./lightning_logs"
+  # En iyi kaç modelin checkpoint'inin saklanacağı.
+  save_top_k: 3
