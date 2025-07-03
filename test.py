@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 # Kendi modüllerimizi import ediyoruz
 try:
-    from orchestrator import TradingSystemOrchestrator
+    from core.orchestrator import TradingSystemOrchestrator
 except ImportError:
     print("HATA: 'orchestrator.py' dosyası bulunamadı. Lütfen aynı dizinde olduğundan emin olun.")
     sys.exit(1)
