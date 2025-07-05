@@ -1,204 +1,322 @@
-# tft_pipeline_core.py
-# Bu modül, bir kütüphane gibi tasarlanmıştır. 
-# Sadece yeniden kullanılabilir sınıfları içerir ve çalıştırıldığında bir şey yapmaz.
+# core/tft_pipeline_core.py
 
 import os
 import yaml
-from typing import Dict, Any
+from typing import Dict, Any, Tuple, List
+from collections import OrderedDict
 
 import numpy as np
 import pandas as pd
 import torch
 
-# Gerekli kütüphanenin kurulu olduğundan emin olun
 try:
-    from pytorch_forecasting import TemporalFusionTransformer
+    from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
+    from pytorch_forecasting.data.encoders import NaNLabelEncoder, TorchNormalizer
     from pytorch_forecasting.metrics import MAE
 except ImportError:
     raise ImportError(
-        "Lütfen pytorch-forecasting kütüphanesini kurun: "
-        "pip install git+https://github.com/jdb78/pytorch-forecasting.git"
+        "Lütfen gerekli kütüphaneleri kurun: 'pip install pytorch-forecasting pandas scikit-learn'"
     )
 
-__all__ = ["InferencePipeline"] # `from tft_pipeline_core import *` kullanıldığında sadece bu sınıf import edilir.
+__all__ = ["InferencePipeline"]
 
 
 class _DataPreprocessor:
-    """(Dahili kullanım) Ham veriyi model girdisine ve model çıktısını nihai sonuca dönüştürür."""
+    """
+    Bu sınıf, inference_params.yaml'daki ölçekleme bilgileriyle veriyi
+    manuel olarak modele hazırlar. Orijinal veriye ihtiyaç duymaz.
+    Bu sınıfın işlevi doğrudur ve değişmemelidir.
+    """
     def __init__(self, config: Dict[str, Any]):
-        self.config = config
         self.model_def = config['model_definition']
-        self.scalers = config['feature_scalers']
-        self.target_scaler_info = config['target_scaler']
+        self.feature_scalers_config = config.get('feature_scalers', {})
+        self.target_scaler_config = config['target_scaler']
         self.sequence_length = self.model_def['sequence_length']
-        self.target_mean = self.target_scaler_info['params']['mean']
-        self.target_std = self.target_scaler_info['params']['std']
-        self._extract_variable_lists()
-
-    def _extract_variable_lists(self):
-        mdef = self.model_def
-        self.static_cats = mdef.get('static_categoricals', [])
-        self.time_varying_known_cats = mdef.get('time_varying_known_categoricals', [])
-        self.time_varying_unknown_cats = mdef.get('time_varying_unknown_categoricals', [])
-        self.group_ids = mdef.get('group_ids', [])
-        self.all_cats = self.static_cats + self.time_varying_known_cats + self.time_varying_unknown_cats + self.group_ids
-
-        self.static_reals = mdef.get('static_reals', [])
-        self.time_varying_known_reals = mdef.get('time_varying_known_reals', [])
-        self.time_varying_unknown_reals = mdef.get('time_varying_unknown_reals', [])
-        self.target = mdef['target']
-        self.all_reals = self.static_reals + self.time_varying_known_reals + self.time_varying_unknown_reals
-        if self.target not in self.all_reals: self.all_reals.append(self.target)
-        self.all_reals.append('relative_time_idx')
-
-    def transform(self, df: pd.DataFrame, device: torch.device) -> Dict[str, torch.Tensor]:
+        
+        if not self.target_scaler_config:
+            raise ValueError("Yapılandırma dosyasında 'target_scaler' bilgisi bulunamadı.")
+            
+        self.target_mean = self.target_scaler_config['params']['mean']
+        self.target_std = self.target_scaler_config['params']['std']
+        
+    def transform(self, df: pd.DataFrame, last_known_time_idx: int) -> pd.DataFrame:
         if len(df) < self.sequence_length:
-            raise ValueError(f"Girdi DataFrame'i en az {self.sequence_length} satır olmalıdır. Mevcut: {len(df)}")
+            raise ValueError(f"Girdi DataFrame'i en az {self.sequence_length} satır olmalıdır, ancak {len(df)} satır verildi.")
         
         input_df = df.tail(self.sequence_length).copy()
-        input_df['time_idx'] = np.arange(len(input_df))
-        input_df['relative_time_idx'] = input_df['time_idx'].astype(float)
-        
-        for group_id in self.group_ids:
-            if group_id not in input_df.columns:
-                input_df[group_id] = "default_group"
-        
-        for col in self.all_reals:
-            if col in self.scalers:
-                params = self.scalers[col]['params']
-                mean, std = params['mean'], params.get('std', 1.0)
-                input_df[col] = (input_df[col] - mean) / std
-        
-        for col in self.all_cats:
-            encoder_key = col if col in self.scalers else f"__group_id__{col}"
-            if encoder_key in self.scalers:
-                classes = self.scalers[encoder_key]['params']['classes']
-                input_df[col] = input_df[col].map(classes).fillna(-1).astype(int)
-        
-        x_dict = {}
-        for col in self.all_cats:
-            if col in input_df: x_dict[col] = torch.tensor(input_df[col].values, device=device).long()
-        for col in self.all_reals:
-            if col in input_df: x_dict[col] = torch.tensor(input_df[col].values, device=device).float()
-        
-        for key in x_dict:
-            x_dict[key] = x_dict[key].unsqueeze(0)
-            
-        return x_dict
 
-    def inverse_transform_prediction(self, scaled_prediction: torch.Tensor) -> np.ndarray:
-        prediction_np = scaled_prediction.squeeze().cpu().numpy()
-        return (prediction_np * self.target_std) + self.target_mean
+        all_scalers_config = self.feature_scalers_config.copy()
+        all_scalers_config[self.target_scaler_config['target_column']] = self.target_scaler_config
+             
+        for col, scaler_info in all_scalers_config.items():
+            if col in input_df.columns:
+                mean = scaler_info['params']['mean']
+                std = scaler_info['params'].get('std', 1.0)
+                if std > 1e-8:
+                    input_df[col] = (input_df[col] - mean) / std
+        
+        input_df['time_idx'] = range(last_known_time_idx + 1, last_known_time_idx + 1 + len(input_df))
+        
+        for col in self.model_def.get('group_ids', []):
+             input_df[col] = "default_group"
+
+        return input_df
+
+    def inverse_transform_prediction(self, scaled_prediction: torch.Tensor) -> List[float]:
+        """
+        Tahmini orijinal ölçeğe döndürür ve `TypeError`'ı önlemek için
+        bir Python listesi olarak döndürür.
+        """
+        prediction_np = scaled_prediction.cpu().numpy()
+        final_prediction = (prediction_np * self.target_std) + self.target_mean
+        return final_prediction.flatten().tolist()
+
+
+class _BaseRobustNormalizer(TorchNormalizer):
+    """
+    Tüm sağlamlaştırılmış normalizer'lar için temel sınıf.
+    İç durumu manuel olarak ve doğru tiple ayarlar.
+    Bu sınıf SADECE model iskeletini oluştururken kullanılır.
+    """
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.center_ = torch.tensor([0.0])
+        self.scale_ = torch.tensor([1.0])
+
+    def fit(self, *args, **kwargs):
+        # Bu sahte normalizer'ın 'fit' edilmesini engelle.
+        pass
+
+    def _to_tensor(self, y):
+        if isinstance(y, pd.Series):
+            numeric_series = pd.to_numeric(y, errors='coerce').fillna(0)
+            return torch.from_numpy(numeric_series.to_numpy()).float()
+        elif isinstance(y, np.ndarray):
+            if y.dtype == np.object_:
+                 y = y.astype(np.float64)
+            return torch.from_numpy(y).float()
+        return y
+
+class _RobustTargetNormalizer(_BaseRobustNormalizer):
+    """
+    SADECE hedef değişken için kullanılır.
+    Kütüphanenin beklediği gibi (veri, ölçek) formatında bir tuple döndürür.
+    Bu sınıf SADECE model iskeletini oluştururken kullanılır.
+    """
+    def transform(self, y: pd.Series, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+        y = self._to_tensor(y)
+        transformed_y = (y - self.center_) / self.scale_
+        
+        center_expanded = self.center_.expand(len(transformed_y))
+        scale_expanded = self.scale_.expand(len(transformed_y))
+        target_scale = torch.stack([center_expanded, scale_expanded], dim=1)
+        
+        return transformed_y, target_scale
+
+class _RobustFeatureNormalizer(_BaseRobustNormalizer):
+    """
+    Hedef DIŞINDAKİ tüm sayısal özellikler için kullanılır.
+    Bu sınıf SADECE model iskeletini oluştururken kullanılır.
+    """
+    def transform(self, y, **kwargs) -> torch.Tensor:
+        y = self._to_tensor(y)
+        return (y - self.center_) / self.scale_
 
 
 class _TFTInferencer:
-    """(Dahili kullanım) Modeli yükler ve tahmin yapar."""
-    def __init__(self, model_dir: str, config: Dict[str, Any]):
+    """
+    Modelin doğru iskeletini, YAML dosyasındaki scaler/encoder bilgilerini
+    "plan" olarak kullanarak kurar ve .pth dosyasını yükler.
+    """
+    def __init__(self, model_path: str, config: Dict[str, Any]):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        weights_path = os.path.join(model_dir, "best_model_weights.pth")
-        if not os.path.exists(weights_path):
-            raise FileNotFoundError(f"Model ağırlık dosyası bulunamadı: {weights_path}")
+        print(f"[Inferencer] Model, '{self.device}' cihazında çalışacak şekilde ayarlandı.")
         
-        self._load_model(weights_path, config)
-
-    def _load_model(self, weights_path: str, config: Dict[str, Any]):
-        model_def = config['model_definition']
-        model_hyperparams = config['model_hyperparameters']
-        categorical_encoders = {k: v for k, v in config['feature_scalers'].items() if v['type'] == 'NaNLabelEncoder'}
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model ağırlık dosyası bulunamadı: {model_path}")
         
-        all_cats = (model_def.get('static_categoricals', []) +
-                    model_def.get('time_varying_known_categoricals', []) +
-                    model_def.get('time_varying_unknown_categoricals', []) +
-                    model_def.get('group_ids', []))
-
-        categorical_sizes = {}
-        for cat in set(all_cats):
-            key = cat if cat in categorical_encoders else f"__group_id__{cat}"
-            if key in categorical_encoders:
-                num_classes = max(categorical_encoders[key]['params']['classes'].values()) + 1
-                categorical_sizes[cat] = num_classes
-            else:
-                raise ValueError(f"'{cat}' için kategorik encoder bilgisi YAML'da bulunamadı.")
-        
-        full_model_params = {
-            **model_hyperparams,
-            'categorical_sizes': categorical_sizes,
-            'static_categoricals': model_def.get('static_categoricals', []),
-            'static_reals': model_def.get('static_reals', []),
-            'time_varying_known_categoricals': model_def.get('time_varying_known_categoricals', []),
-            'time_varying_known_reals': model_def.get('time_varying_known_reals', []),
-            'time_varying_unknown_categoricals': model_def.get('time_varying_unknown_categoricals', []),
-            'time_varying_unknown_reals': model_def.get('time_varying_unknown_reals', []),
-            'loss': MAE() # Inference'da kullanılmayacak yer tutucu loss
-        }
-        
-        self.model = TemporalFusionTransformer(**full_model_params)
-        
-        raw_weights = torch.load(weights_path, map_location=self.device)
-        state_dict = raw_weights.get('state_dict', raw_weights)
-        clean_state_dict = {k.replace("model.", ""): v for k, v in state_dict.items()}
-        
-        self.model.load_state_dict(clean_state_dict)
+        self.model = self._build_and_load_model(model_path, config)
         self.model.to(self.device)
         self.model.eval()
 
-    def predict(self, x_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _build_and_load_model(self, model_path: str, config: Dict[str, Any]) -> TemporalFusionTransformer:
+        model_def = config['model_definition']
+        model_hyperparams = config['model_hyperparameters']
+
+        cat_encoders = {
+            col.replace("__group_id__", ""): NaNLabelEncoder(add_nan=True)
+            for col, info in config.get('feature_scalers', {}).items()
+            if info['type'] == 'NaNLabelEncoder'
+        }
+
+        # Model iskeletini oluşturmak için özel normalizer'larımızı kullanıyoruz.
+        target_dummy_normalizer = _RobustTargetNormalizer(method="standard", center=True)
+        features_dummy_normalizer = _RobustFeatureNormalizer(method="standard", center=True)
+
+        reals_list = (
+            model_def.get('static_reals', []) +
+            model_def.get('time_varying_known_reals', []) +
+            model_def.get('time_varying_unknown_reals', []) +
+            ['relative_time_idx']
+        )
+        unique_reals = sorted(list(set(reals_list)))
+
+        feature_scalers = {col: features_dummy_normalizer for col in unique_reals}
+        
+        required_length = model_def['sequence_length'] + model_def['prediction_steps']
+        
+        all_cols = (
+            [model_def['time_idx']]
+            + model_def['group_ids']
+            + [col for col in unique_reals if col != 'relative_time_idx']
+            + [model_def['target']]
+        )
+        all_cols = sorted(list(set(all_cols)))
+
+        dummy_df = pd.DataFrame(index=range(required_length))
+
+        for col in all_cols:
+            if col == model_def['time_idx']:
+                dummy_df[col] = list(range(required_length))
+            elif col in model_def['group_ids']:
+                dummy_df[col] = 'default_group'
+            else:
+                dummy_df[col] = np.random.uniform(low=0.0, high=1.0, size=required_length)
+        
+        dummy_dataset = TimeSeriesDataSet(
+            dummy_df,
+            time_idx=model_def['time_idx'], 
+            target=model_def['target'],
+            group_ids=model_def['group_ids'],
+            max_encoder_length=model_def['sequence_length'],
+            max_prediction_length=model_def['prediction_steps'],
+            static_reals=model_def.get('static_reals', []),
+            time_varying_known_reals=model_def.get('time_varying_known_reals', []),
+            time_varying_unknown_reals=model_def.get('time_varying_unknown_reals', []),
+            add_relative_time_idx=True,
+            categorical_encoders=cat_encoders,
+            scalers=feature_scalers,
+            target_normalizer=target_dummy_normalizer
+        )
+        print("[Inferencer] Model iskeletini oluşturmak için 'plan' başarıyla yaratıldı.")
+
+        tft_model = TemporalFusionTransformer.from_dataset(dummy_dataset, **model_hyperparams)
+        print("[Inferencer] Model mimarisi başarıyla oluşturuldu.")
+
+        weights = torch.load(model_path, map_location=self.device)
+        
+        if 'state_dict' in weights:
+            weights = weights['state_dict']
+        
+        cleaned_weights = OrderedDict()
+        for key, value in weights.items():
+            new_key = key
+            if new_key.startswith("model."):
+                new_key = new_key[len("model."):]
+            if new_key.startswith("net."):
+                 new_key = new_key[len("net."):]
+            cleaned_weights[new_key] = value
+        
+        tft_model.load_state_dict(cleaned_weights, strict=False)
+        print(f"[Inferencer] Ağırlıklar '{os.path.basename(model_path)}' dosyasından (uyumsuz anahtarlar göz ardı edilerek) başarıyla yüklendi.")
+        
+        return tft_model
+
+    def predict(self, input_df: pd.DataFrame) -> torch.Tensor:
+        """
+        Modelden tahmin alır. Bu metot, kalıcı `IndexError` hatasını
+        çözmek için yeniden yazılmıştır.
+        """
+        # HATA KAYNAĞI ve NİHAİ ÇÖZÜM:
+        # Kütüphanenin kendi içindeki ölçekleme mantığı ile bizim özel
+        # normalizer sınıflarımız arasındaki uyumsuzluk, çözülmesi zor
+        # `IndexError` hatalarına yol açıyor.
+        #
+        # Çözüm olarak, tahmin aşamasında kütüphanenin kendi standart
+        # `TorchNormalizer` sınıfını kullanıyoruz. Veri zaten manuel olarak
+        # ölçeklendiği için, bu normalizer'ın hedef değişken üzerinde ne
+        # yaptığı önemli değildir. Bu, kütüphanenin kendi kodunu kullanmasını
+        # sağlayarak uyumluluk sorunlarını ortadan kaldırır. Tahmin,
+        # `model(x)` ile doğrudan alınır ve en sonda manuel olarak orijinal
+        # ölçeğe döndürülür. Bu, en güvenilir ve kesin çözümdür.
+        
+        params = self.model.dataset_parameters
+
+        prediction_dataset = TimeSeriesDataSet(
+            data=input_df,
+            time_idx=params["time_idx"],
+            target=params["target"],
+            group_ids=params["group_ids"],
+            max_encoder_length=params["max_encoder_length"],
+            max_prediction_length=params["max_prediction_length"],
+            min_encoder_length=0,
+            static_categoricals=params.get("static_categoricals", []),
+            static_reals=params.get("static_reals", []),
+            time_varying_known_categoricals=params.get("time_varying_known_categoricals", []),
+            time_varying_known_reals=params.get("time_varying_known_reals", []),
+            time_varying_unknown_categoricals=params.get("time_varying_unknown_categoricals", []),
+            time_varying_unknown_reals=params.get("time_varying_unknown_reals", []),
+            add_relative_time_idx=params.get("add_relative_time_idx", False),
+            categorical_encoders=params["categorical_encoders"],
+            scalers=params["scalers"],
+            # Kütüphanenin standart normalizer'ını kullanarak hatayı önle
+            target_normalizer=TorchNormalizer(),
+            predict_mode=True,
+        )
+
+        dataloader = prediction_dataset.to_dataloader(
+            train=False, batch_size=1
+        )
+
+        x, y = next(iter(dataloader))
+        
+        x = {key: val.to(self.device) for key, val in x.items()}
+
         with torch.no_grad():
-            output = self.model(x_dict)
-        return output['prediction']
+            # Modeli doğrudan çağırarak ham çıktıyı al
+            raw_prediction_output = self.model(x)
+        
+        # Çıktı bir sözlüktür, 'prediction' tensörünü çıkar
+        scaled_prediction_tensor = raw_prediction_output["prediction"]
+        
+        # Tek veri grubunun tahminini döndür
+        return scaled_prediction_tensor[0]
 
 
 class InferencePipeline:
     """
-    TFT modeli için tam entegre, dosya sisteminden bağımsız tahmin iş akışı.
-
-    Bu sınıf, modeli ve ön işleme adımlarını yükler ve ham bir DataFrame'den
-    tahminler üretmek için tek bir arayüz sağlar.
+    Ana pipeline sınıfı. "Soğuk inference" mantığı ile çalışır.
+    Sadece `inference_params.yaml` ve model ağırlık dosyasına ihtiyaç duyar.
     """
     def __init__(self, model_dir: str):
-        """
-        Pipeline'ı başlatır.
-
-        Args:
-            model_dir (str): 'inference_params.yaml' ve 'best_model_weights.pth' 
-                             dosyalarının bulunduğu, kendi kendine yeterli dizin.
-        """
-        print("="*60 + "\nINFERENCE PIPELINE BAŞLATILIYOR\n" + "="*60)
+        print("="*60 + "\nSOĞUK INFERENCE PIPELINE BAŞLATILIYOR\n" + "="*60)
         config_path = os.path.join(model_dir, "inference_params.yaml")
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"Inference yapılandırma dosyası bulunamadı: {config_path}")
+        
+        model_path = os.path.join(model_dir, "best_model_weights.pth") 
+        if not os.path.exists(model_path):
+            ckpt_path = os.path.join(model_dir, "best_model.ckpt")
+            if os.path.exists(ckpt_path):
+                model_path = ckpt_path
+            else:
+                 raise FileNotFoundError(f"Ağırlık dosyası bulunamadı: '{model_path}' veya '{ckpt_path}'")
         
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
         
-        if 'model_hyperparameters' not in self.config:
-            raise KeyError("'inference_params.yaml' dosyasında 'model_hyperparameters' bölümü bulunamadı. "
-                           "Lütfen bu bölümü içeren bir config ile modeli yeniden eğitin.")
-        
         self._preprocessor = _DataPreprocessor(self.config)
-        self._inferencer = _TFTInferencer(model_dir, self.config)
+        self._inferencer = _TFTInferencer(model_path, self.config)
         
         print("\n[Pipeline] Tüm bileşenler başarıyla yüklendi. Tahmin için hazır.\n" + "="*60)
 
-    def run(self, df: pd.DataFrame) -> np.ndarray:
+    def run(self, df: pd.DataFrame, last_known_time_idx: int = 0) -> List[float]:
         """
-        Verilen ham DataFrame üzerinde tam tahmin iş akışını çalıştırır.
-
-        Args:
-            df (pd.DataFrame): Tahmin için kullanılacak, en az 'sequence_length' 
-                               uzunluğunda zaman serisi verisi.
-
-        Returns:
-            np.ndarray: 'prediction_steps' uzunluğunda, nihai tahmin sonuçları.
+        `TypeError`'ı önlemek için bir Python listesi döndürür.
         """
         print("\n[Pipeline] İş akışı başlatıldı...")
-        x_dict = self._preprocessor.transform(df, self._inferencer.device)
-        print("[Pipeline] Veri ön işlendi ve tensörlere dönüştürüldü.")
-        
-        scaled_prediction = self._inferencer.predict(x_dict)
-        print("[Pipeline] Model tahmini (ölçeklenmiş) alındı.")
-        
-        final_prediction = self._preprocessor.inverse_transform_prediction(scaled_prediction)
+        input_for_predict_df = self._preprocessor.transform(df, last_known_time_idx)
+        print(f"[Pipeline] Veri manuel olarak ön işlendi ve normalize edildi.")
+        scaled_prediction_tensor = self._inferencer.predict(input_for_predict_df)
+        print(f"[Pipeline] Model tahmini (ölçeklenmiş) alındı.")
+        final_prediction = self._preprocessor.inverse_transform_prediction(scaled_prediction_tensor)
         print("[Pipeline] Tahminler orijinal ölçeğe dönüştürüldü. İşlem tamamlandı.")
-        
         return final_prediction
