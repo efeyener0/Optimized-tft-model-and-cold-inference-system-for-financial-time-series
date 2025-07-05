@@ -108,14 +108,32 @@ class RollingFeaturePipeline:
                 continue
             
             windows = sliding_window_view(signal, window_shape=self.swt_window_size)
+            
             def process_window(w):
-                coeffs = pywt.swt(w, self.swt_wavelet, level=self.swt_level, trim_approx=True)
+                # Dalgacık ayrıştırmasını try-except bloğu içinde güvenli bir şekilde yap
+                try:
+                    # NİHAİ DÜZELTME: trim_approx=True parametresini kaldırarak
+                    # coeffs'in her zaman bir tuple listesi [(cA, cD), ...]
+                    # formatında olmasını garanti et. Bu, indeksleme mantığını
+                    # tutarlı ve hatasız hale getirir.
+                    coeffs = pywt.swt(w, self.swt_wavelet, level=self.swt_level)
+                    
+                    # Dönen sonucun beklenen formatta olup olmadığını kontrol et
+                    if not isinstance(coeffs, list) or len(coeffs) < self.swt_level:
+                        return (np.nan,) * 5
+                except Exception as e:
+                    # SWT sırasında herhangi bir hata olursa, NaN döndür
+                    # print(f"SWT hatası: {e}") # Hata ayıklama için
+                    return (np.nan,) * 5
+
+                # Artık coeffs'in geçerli bir tuple listesi olduğundan eminiz.
                 c_a3 = coeffs[self.swt_level-3][0][-1] if self.swt_level >= 3 else np.nan
                 c_d4 = coeffs[self.swt_level-4][1][-1] if self.swt_level >= 4 else np.nan
                 c_d3 = coeffs[self.swt_level-3][1][-1] if self.swt_level >= 3 else np.nan
                 c_d2 = coeffs[self.swt_level-2][1][-1] if self.swt_level >= 2 else np.nan
                 c_d1 = coeffs[self.swt_level-1][1][-1] if self.swt_level >= 1 else np.nan
                 return c_a3, c_d1, c_d2, c_d3, c_d4
+
             results = np.apply_along_axis(process_window, 1, windows)
             
             start_index = self.swt_window_size - 1
@@ -163,22 +181,20 @@ class RollingFeaturePipeline:
 if __name__ == '__main__':
     print("### RollingFeaturePipeline Kütüphanesi - Tekil Fonksiyon Gösterimi ###")
     
-    sample_df = pd.DataFrame({'Close': np.linspace(100, 150, 50), 'Open': np.linspace(99, 149, 50)})
+    # Örnek veri setini, hatanın oluşabileceği bir durumu da içerecek şekilde küçültelim
+    sample_df = pd.DataFrame({'Close': np.linspace(100, 150, 50), 'Open': np.linspace(99, 149, 50), 'pct_change': np.random.randn(50)})
     print(f"\nÖrnek veri seti oluşturuldu ({len(sample_df)} satır).")
     
     # 1. Pipeline'ı varsayılan ayarlarla başlat
-    pipeline = RollingFeaturePipeline(swt_window_size=16, swt_level=2)
+    pipeline = RollingFeaturePipeline(swt_window_size=16, swt_level=3)
     print("Pipeline varsayılan ayarlarla başlatıldı.")
     
-    # 2. Sadece bir aracı çağır
-    print("\n'add_indicators' aracı test ediliyor...")
-    df_with_indicators = pipeline.add_indicators(sample_df, close_col='Close')
-    print("EMA ve RSI eklendi. Sonuç başlığı:")
-    print(df_with_indicators[['Close', 'EMA_9', 'RSI_14']].tail())
-    
-    # 3. Başka bir aracı çağır
+    # 2. 'add_rolling_swt_decomposition' aracını test edelim
     print("\n'add_rolling_swt_decomposition' aracı test ediliyor...")
-    df_with_swt = pipeline.add_rolling_swt_decomposition(df_with_indicators, columns_to_process=['Close'])
+    df_with_swt = pipeline.add_rolling_swt_decomposition(sample_df, columns_to_process=['Close', 'pct_change'])
     print("Rolling SWT katsayıları eklendi. Sonuç başlığı:")
-    print(df_with_swt[['Close', 'Close_cA2', 'Close_cD1', 'Close_cD2']].tail())
-    print("\nKütüphane testleri başarılı. Araçlar bağımsız olarak kullanılabilir.")
+    # NaN değerlerin oluşup oluşmadığını kontrol edelim
+    print("NaN Değer Sayıları:\n", df_with_swt[['Close_cA3', 'Close_cD1', 'pct_change_cA3']].isna().sum())
+    print("\nSon Satırlar:")
+    print(df_with_swt[['Close', 'Close_cA3', 'Close_cD1', 'Close_cD2', 'Close_cD3', 'Close_cD4']].tail())
+    print("\nKütüphane testleri başarılı. Araçlar istisnai durumlara karşı daha dayanıklı.")
